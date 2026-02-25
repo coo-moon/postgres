@@ -635,6 +635,58 @@ user_id users.user_id%TYPE;
 
   </sect2>
 
+  <sect2 id="plpgsql-declaration-tableof">
+   <title>Collection Types (Oracle Compatibility)</title>
+
+   <indexterm zone="plpgsql-declaration-tableof">
+    <primary>TYPE IS TABLE OF</primary>
+    <secondary>in PL/pgSQL</secondary>
+   </indexterm>
+
+<synopsis>
+TYPE <replaceable>type_name</replaceable> IS TABLE OF <replaceable>data_type</replaceable>;
+<replaceable>name</replaceable> <replaceable>type_name</replaceable>;
+</synopsis>
+
+   <para>
+    For Oracle compatibility, <application>PL/pgSQL</application> supports
+    collection type declarations using the <literal>TYPE ... IS TABLE OF</literal>
+    syntax. This declares a collection type that is internally mapped to a
+    <productname>PostgreSQL</productname> array type. For example:
+<programlisting>
+DECLARE
+    TYPE int_table IS TABLE OF integer;
+    TYPE name_table IS TABLE OF varchar(100);
+    v_ids int_table;
+    v_names name_table;
+</programlisting>
+    is equivalent to:
+<programlisting>
+DECLARE
+    v_ids integer[];
+    v_names varchar(100)[];
+</programlisting>
+   </para>
+
+   <para>
+    Variables declared with <literal>TYPE ... IS TABLE OF</literal> behave
+    exactly like <productname>PostgreSQL</productname> array variables.
+    Elements can be accessed using the standard array subscript notation
+    <literal>v[i]</literal> (1-based indexing). Standard array functions
+    such as <function>array_length()</function>,
+    <function>cardinality()</function>, and <function>array_append()</function>
+    can be used with these variables. The <literal>FOREACH</literal>
+    loop construct also works with these variables.
+   </para>
+
+   <para>
+    The collection type name is only visible within the
+    <literal>DECLARE</literal> section of the same block where it is
+    defined.
+   </para>
+
+  </sect2>
+
     <sect2 id="plpgsql-declaration-rowtypes">
      <title>Row Types</title>
 
@@ -1142,6 +1194,74 @@ CONTEXT:  PL/pgSQL function get_userid(text) line 6 at SQL statement
     <para>
      To handle cases where you need to process multiple result rows
      from a SQL query, see <xref linkend="plpgsql-records-iterating"/>.
+    </para>
+
+   </sect2>
+
+   <sect2 id="plpgsql-statements-bulk-collect">
+    <title>Executing a Query with BULK COLLECT INTO (Oracle Compatibility)</title>
+
+    <indexterm zone="plpgsql-statements-bulk-collect">
+     <primary>BULK COLLECT INTO</primary>
+     <secondary>in PL/pgSQL</secondary>
+    </indexterm>
+
+    <para>
+     For Oracle compatibility, <application>PL/pgSQL</application> supports the
+     <literal>BULK COLLECT INTO</literal> clause, which collects all rows from a
+     query result into array variables. Each column of the result set is
+     collected into a separate array variable.
+
+<synopsis>
+SELECT <replaceable>select_expressions</replaceable> BULK COLLECT INTO <replaceable>array_var1</replaceable> <optional>, <replaceable>array_var2</replaceable>, ...</optional> FROM ...;
+</synopsis>
+    </para>
+
+    <para>
+     Unlike regular <literal>SELECT INTO</literal>, which returns only the first
+     row, <literal>BULK COLLECT INTO</literal> returns all matching rows. Each
+     target variable must be an array type (either declared using
+     <literal>TYPE ... IS TABLE OF</literal> or as a standard
+     <productname>PostgreSQL</productname> array).
+
+<programlisting>
+DO $$
+DECLARE
+    TYPE int_table IS TABLE OF integer;
+    TYPE text_table IS TABLE OF text;
+    v_ids int_table;
+    v_names text_table;
+BEGIN
+    SELECT id, name BULK COLLECT INTO v_ids, v_names
+    FROM employees ORDER BY id;
+
+    -- Process the collected data
+    FOR i IN 1..array_length(v_ids, 1) LOOP
+        RAISE NOTICE 'Employee %: %', v_ids[i], v_names[i];
+    END LOOP;
+END;
+$$;
+</programlisting>
+    </para>
+
+    <para>
+     If the query returns no rows, the target arrays are set to empty arrays.
+     The number of target array variables must not exceed the number of columns
+     in the query result. NULL values in the result set are preserved in the
+     arrays.
+    </para>
+
+    <para>
+     <literal>BULK COLLECT INTO</literal> can also be used with cursors via
+     the <command>FETCH</command> statement (see
+     <xref linkend="plpgsql-cursor-using"/>):
+
+<programlisting>
+FETCH <replaceable>cursor</replaceable> BULK COLLECT INTO <replaceable>array_var1</replaceable> <optional>, <replaceable>array_var2</replaceable>, ...</optional>;
+</programlisting>
+
+     This fetches all remaining rows from the cursor into the specified
+     array variables.
     </para>
 
    </sect2>
