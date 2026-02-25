@@ -308,6 +308,10 @@ static int	exec_stmt_assert(PLpgSQL_execstate *estate,
 							 PLpgSQL_stmt_assert *stmt);
 static int	exec_stmt_execsql(PLpgSQL_execstate *estate,
 							  PLpgSQL_stmt_execsql *stmt);
+static void exec_bulk_collect_into(PLpgSQL_execstate *estate,
+								   PLpgSQL_variable *target,
+								   SPITupleTable *tuptab,
+								   uint64 nrows);
 static int	exec_stmt_dynexecute(PLpgSQL_execstate *estate,
 								 PLpgSQL_stmt_dynexecute *stmt);
 static int	exec_stmt_dynfors(PLpgSQL_execstate *estate,
@@ -4128,6 +4132,105 @@ exec_prepare_plan(PLpgSQL_execstate *estate,
 
 
 /* ----------
+ * exec_bulk_collect_into		Collect all rows from a result set into
+ *								array variables (Oracle BULK COLLECT INTO).
+ *
+ * The target must be a PLpgSQL_row containing references to array variables.
+ * Each column of each row is appended to the corresponding target array.
+ * ----------
+ */
+static void
+exec_bulk_collect_into(PLpgSQL_execstate *estate,
+					   PLpgSQL_variable *target,
+					   SPITupleTable *tuptab,
+					   uint64 nrows)
+{
+	PLpgSQL_row *row;
+	TupleDesc	tupdesc;
+	int			fnum;
+
+	if (target->dtype != PLPGSQL_DTYPE_ROW)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("BULK COLLECT INTO target must be array variables")));
+
+	row = (PLpgSQL_row *) target;
+	tupdesc = tuptab->tupdesc;
+
+	if (row->nfields > tupdesc->natts)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("BULK COLLECT INTO has more target variables than query columns")));
+
+	for (fnum = 0; fnum < row->nfields; fnum++)
+	{
+		PLpgSQL_var	   *var;
+		Oid				elem_typoid;
+		Oid				arr_typoid;
+		int16			elem_typlen;
+		bool			elem_typbyval;
+		char			elem_typalign;
+		Datum		   *values;
+		bool		   *nulls;
+		uint64			j;
+		ArrayType	   *arr;
+		int				dims[1];
+		int				lbs[1];
+
+		var = (PLpgSQL_var *) estate->datums[row->varnos[fnum]];
+		if (var->dtype != PLPGSQL_DTYPE_VAR)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("BULK COLLECT INTO target must be scalar array variables")));
+
+		elem_typoid = tupdesc->attrs[fnum].atttypid;
+		arr_typoid = get_array_type(elem_typoid);
+		if (!OidIsValid(arr_typoid))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("could not find array type for data type %s",
+							format_type_be(elem_typoid))));
+
+		get_typlenbyvalalign(elem_typoid, &elem_typlen,
+							 &elem_typbyval, &elem_typalign);
+
+		if (nrows == 0)
+		{
+			arr = construct_empty_array(elem_typoid);
+			exec_assign_value(estate, (PLpgSQL_datum *) var,
+							  PointerGetDatum(arr), false,
+							  arr_typoid, -1);
+			pfree(arr);
+			continue;
+		}
+
+		values = (Datum *) palloc(sizeof(Datum) * nrows);
+		nulls = (bool *) palloc(sizeof(bool) * nrows);
+
+		for (j = 0; j < nrows; j++)
+		{
+			values[j] = SPI_getbinval(tuptab->vals[j], tupdesc,
+									  fnum + 1, &nulls[j]);
+		}
+
+		dims[0] = (int) nrows;
+		lbs[0] = 1;
+		arr = construct_md_array(values, nulls, 1, dims, lbs,
+								 elem_typoid, elem_typlen,
+								 elem_typbyval, elem_typalign);
+
+		exec_assign_value(estate, (PLpgSQL_datum *) var,
+						  PointerGetDatum(arr), false,
+						  arr_typoid, -1);
+
+		pfree(values);
+		pfree(nulls);
+		pfree(arr);
+	}
+}
+
+
+/* ----------
  * exec_stmt_execsql			Execute an SQL statement (possibly with INTO).
  *
  * Note: some callers rely on this not touching stmt_mcontext.  If it ever
@@ -4195,14 +4298,13 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 	 * treated strictly. Without INTO, just run the statement to completion
 	 * (tcount = 0).
 	 *
-	 * We could just ask for two rows always when using INTO, but there are
-	 * some cases where demanding the extra row costs significant time, eg by
-	 * forcing completion of a sequential scan.  So don't do it unless we need
-	 * to enforce strictness.
+	 * For BULK COLLECT INTO, we need all rows (tcount = 0).
 	 */
 	if (stmt->into)
 	{
-		if (stmt->strict || stmt->mod_stmt || too_many_rows_level)
+		if (stmt->bulk_collect)
+			tcount = 0;
+		else if (stmt->strict || stmt->mod_stmt || too_many_rows_level)
 			tcount = 2;
 		else
 			tcount = 1;
@@ -4292,52 +4394,60 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 		/* Fetch target's datum entry */
 		target = (PLpgSQL_variable *) estate->datums[stmt->target->dno];
 
-		/*
-		 * If SELECT ... INTO specified STRICT, and the query didn't find
-		 * exactly one row, throw an error.  If STRICT was not specified, then
-		 * allow the query to find any number of rows.
-		 */
-		if (n == 0)
+		if (stmt->bulk_collect)
 		{
-			if (stmt->strict)
-			{
-				char	   *errdetail;
-
-				if (estate->func->print_strict_params)
-					errdetail = format_expr_params(estate, expr);
-				else
-					errdetail = NULL;
-
-				ereport(ERROR,
-						(errcode(ERRCODE_NO_DATA_FOUND),
-						 errmsg("query returned no rows"),
-						 errdetail ? errdetail_internal("parameters: %s", errdetail) : 0));
-			}
-			/* set the target to NULL(s) */
-			exec_move_row(estate, target, NULL, tuptab->tupdesc);
+			/* BULK COLLECT INTO: collect all rows into array variables */
+			exec_bulk_collect_into(estate, target, tuptab, n);
 		}
 		else
 		{
-			if (n > 1 && (stmt->strict || stmt->mod_stmt || too_many_rows_level))
+			/*
+			 * If SELECT ... INTO specified STRICT, and the query didn't find
+			 * exactly one row, throw an error.  If STRICT was not specified,
+			 * then allow the query to find any number of rows.
+			 */
+			if (n == 0)
 			{
-				char	   *errdetail;
-				int			errlevel;
+				if (stmt->strict)
+				{
+					char	   *errdetail;
 
-				if (estate->func->print_strict_params)
-					errdetail = format_expr_params(estate, expr);
-				else
-					errdetail = NULL;
+					if (estate->func->print_strict_params)
+						errdetail = format_expr_params(estate, expr);
+					else
+						errdetail = NULL;
 
-				errlevel = (stmt->strict || stmt->mod_stmt) ? ERROR : too_many_rows_level;
-
-				ereport(errlevel,
-						(errcode(ERRCODE_TOO_MANY_ROWS),
-						 errmsg("query returned more than one row"),
-						 errdetail ? errdetail_internal("parameters: %s", errdetail) : 0,
-						 errhint("Make sure the query returns a single row, or use LIMIT 1.")));
+					ereport(ERROR,
+							(errcode(ERRCODE_NO_DATA_FOUND),
+							 errmsg("query returned no rows"),
+							 errdetail ? errdetail_internal("parameters: %s", errdetail) : 0));
+				}
+				/* set the target to NULL(s) */
+				exec_move_row(estate, target, NULL, tuptab->tupdesc);
 			}
-			/* Put the first result row into the target */
-			exec_move_row(estate, target, tuptab->vals[0], tuptab->tupdesc);
+			else
+			{
+				if (n > 1 && (stmt->strict || stmt->mod_stmt || too_many_rows_level))
+				{
+					char	   *errdetail;
+					int			errlevel;
+
+					if (estate->func->print_strict_params)
+						errdetail = format_expr_params(estate, expr);
+					else
+						errdetail = NULL;
+
+					errlevel = (stmt->strict || stmt->mod_stmt) ? ERROR : too_many_rows_level;
+
+					ereport(errlevel,
+							(errcode(ERRCODE_TOO_MANY_ROWS),
+							 errmsg("query returned more than one row"),
+							 errdetail ? errdetail_internal("parameters: %s", errdetail) : 0,
+							 errhint("Make sure the query returns a single row, or use LIMIT 1.")));
+				}
+				/* Put the first result row into the target */
+				exec_move_row(estate, target, tuptab->vals[0], tuptab->tupdesc);
+			}
 		}
 
 		/* Clean up */
@@ -4788,11 +4898,16 @@ exec_stmt_fetch(PLpgSQL_execstate *estate, PLpgSQL_stmt_fetch *stmt)
 	{
 		PLpgSQL_variable *target;
 
-		/* ----------
-		 * Fetch 1 tuple from the cursor
-		 * ----------
-		 */
-		SPI_scroll_cursor_fetch(portal, stmt->direction, how_many);
+		if (stmt->bulk_collect)
+		{
+			/* BULK COLLECT: fetch all remaining rows */
+			SPI_scroll_cursor_fetch(portal, FETCH_FORWARD, FETCH_ALL);
+		}
+		else
+		{
+			/* Normal: fetch 1 tuple */
+			SPI_scroll_cursor_fetch(portal, stmt->direction, how_many);
+		}
 		tuptab = SPI_tuptable;
 		n = SPI_processed;
 
@@ -4801,10 +4916,18 @@ exec_stmt_fetch(PLpgSQL_execstate *estate, PLpgSQL_stmt_fetch *stmt)
 		 * ----------
 		 */
 		target = (PLpgSQL_variable *) estate->datums[stmt->target->dno];
-		if (n == 0)
-			exec_move_row(estate, target, NULL, tuptab->tupdesc);
+
+		if (stmt->bulk_collect)
+		{
+			exec_bulk_collect_into(estate, target, tuptab, n);
+		}
 		else
-			exec_move_row(estate, target, tuptab->vals[0], tuptab->tupdesc);
+		{
+			if (n == 0)
+				exec_move_row(estate, target, NULL, tuptab->tupdesc);
+			else
+				exec_move_row(estate, target, tuptab->vals[0], tuptab->tupdesc);
+		}
 
 		exec_eval_cleanup(estate);
 		SPI_freetuptable(tuptab);

@@ -801,6 +801,7 @@ typedef struct PLpgSQL_stmt_fetch
 	PLpgSQL_expr *expr;			/* count, if expression */
 	bool		is_move;		/* is this a fetch or move? */
 	bool		returns_multiple_rows;	/* can return more than one row? */
+	bool		bulk_collect;	/* BULK COLLECT INTO? (Oracle compat) */
 } PLpgSQL_stmt_fetch;
 
 /*
@@ -913,6 +914,7 @@ typedef struct PLpgSQL_stmt_execsql
 	bool		into;			/* INTO supplied? */
 	bool		strict;			/* INTO STRICT flag */
 	bool		mod_stmt_set;	/* is mod_stmt valid yet? */
+	bool		bulk_collect;	/* BULK COLLECT INTO? (Oracle compat) */
 	PLpgSQL_variable *target;	/* INTO target (record or row) */
 } PLpgSQL_stmt_execsql;
 

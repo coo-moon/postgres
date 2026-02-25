@@ -1236,7 +1236,9 @@ dump_fetch(PLpgSQL_stmt_fetch *stmt)
 
 	if (!stmt->is_move)
 	{
-		printf("FETCH curvar=%d\n", stmt->curvar);
+		printf("FETCH%s curvar=%d\n",
+			   stmt->bulk_collect ? " BULK COLLECT" : "",
+			   stmt->curvar);
 		dump_cursor_direction(stmt);
 
 		dump_indent += 2;
@@ -1521,7 +1523,8 @@ dump_execsql(PLpgSQL_stmt_execsql *stmt)
 	if (stmt->target != NULL)
 	{
 		dump_ind();
-		printf("    INTO%s target = %d %s\n",
+		printf("    %sINTO%s target = %d %s\n",
+			   stmt->bulk_collect ? "BULK COLLECT " : "",
 			   stmt->strict ? " STRICT" : "",
 			   stmt->target->dno, stmt->target->refname);
 	}

@@ -23,8 +23,102 @@
 #include "parser/scanner.h"
 #include "parser/scansup.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 
 #include "plpgsql.h"
+
+/*
+ * Oracle-compatible TYPE ... IS TABLE OF support.
+ * We maintain a list of registered "table of" type aliases during compilation.
+ * Each entry maps a user-defined type name to a PostgreSQL array type.
+ */
+typedef struct TableOfType
+{
+	char	   *name;
+	PLpgSQL_type *type;
+	struct TableOfType *next;
+} TableOfType;
+
+static TableOfType *tableof_types = NULL;
+static bool read_datatype_tableof_decl = false;
+
+static void
+register_tableof_type(const char *name, PLpgSQL_type *type)
+{
+	TableOfType *entry;
+	MemoryContext oldcxt;
+
+	oldcxt = MemoryContextSwitchTo(plpgsql_compile_tmp_cxt);
+	entry = palloc(sizeof(TableOfType));
+	entry->name = pstrdup(name);
+	entry->type = type;
+	entry->next = tableof_types;
+	tableof_types = entry;
+	MemoryContextSwitchTo(oldcxt);
+}
+
+static PLpgSQL_type *
+lookup_tableof_type(const char *name)
+{
+	TableOfType *entry;
+
+	for (entry = tableof_types; entry != NULL; entry = entry->next)
+	{
+		if (pg_strcasecmp(entry->name, name) == 0)
+			return entry->type;
+	}
+	return NULL;
+}
+
+static bool
+parse_tableof_pattern(const char *text, char **name_p, char **basetype_p)
+{
+	const char *p = text;
+	const char *name_start, *name_end;
+
+	while (*p && isspace((unsigned char) *p))
+		p++;
+
+	name_start = p;
+	if (!(*p) || !(isalpha((unsigned char) *p) || *p == '_'))
+		return false;
+	while (*p && (isalnum((unsigned char) *p) || *p == '_'))
+		p++;
+	name_end = p;
+
+	while (*p && isspace((unsigned char) *p))
+		p++;
+	if (pg_strncasecmp(p, "is", 2) != 0)
+		return false;
+	if (p[2] && (isalnum((unsigned char) p[2]) || p[2] == '_'))
+		return false;
+	p += 2;
+
+	while (*p && isspace((unsigned char) *p))
+		p++;
+	if (pg_strncasecmp(p, "table", 5) != 0)
+		return false;
+	if (p[5] && (isalnum((unsigned char) p[5]) || p[5] == '_'))
+		return false;
+	p += 5;
+
+	while (*p && isspace((unsigned char) *p))
+		p++;
+	if (pg_strncasecmp(p, "of", 2) != 0)
+		return false;
+	if (p[2] && (isalnum((unsigned char) p[2]) || p[2] == '_'))
+		return false;
+	p += 2;
+
+	while (*p && isspace((unsigned char) *p))
+		p++;
+	if (*p == '\0')
+		return false;
+
+	*name_p = pnstrdup(name_start, name_end - name_start);
+	*basetype_p = pstrdup(p);
+	return true;
+}
 
 
 /* Location tracking support --- simpler than bison's default */
@@ -259,11 +353,13 @@ static	void			check_raise_parameters(PLpgSQL_stmt_raise *stmt);
 %token <keyword>	K_ASSERT
 %token <keyword>	K_BACKWARD
 %token <keyword>	K_BEGIN
+%token <keyword>	K_BULK
 %token <keyword>	K_BY
 %token <keyword>	K_CALL
 %token <keyword>	K_CASE
 %token <keyword>	K_CHAIN
 %token <keyword>	K_CLOSE
+%token <keyword>	K_COLLECT
 %token <keyword>	K_COLLATE
 %token <keyword>	K_COLUMN
 %token <keyword>	K_COLUMN_NAME
@@ -316,6 +412,7 @@ static	void			check_raise_parameters(PLpgSQL_stmt_raise *stmt);
 %token <keyword>	K_NOT
 %token <keyword>	K_NOTICE
 %token <keyword>	K_NULL
+%token <keyword>	K_OF
 %token <keyword>	K_OPEN
 %token <keyword>	K_OPTION
 %token <keyword>	K_OR
@@ -493,41 +590,53 @@ decl_stmt		: decl_statement
 
 decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull decl_defval
 					{
-						PLpgSQL_variable	*var;
-
 						/*
-						 * If a collation is supplied, insert it into the
-						 * datatype.  We assume decl_datatype always returns
-						 * a freshly built struct not shared with other
-						 * variables.
+						 * Check if this was a TYPE ... IS TABLE OF declaration.
+						 * If so, the type was already registered by read_datatype;
+						 * skip variable creation.
 						 */
-						if (OidIsValid($4))
+						if (read_datatype_tableof_decl)
 						{
-							if (!OidIsValid($3->collation))
-								ereport(ERROR,
-										(errcode(ERRCODE_DATATYPE_MISMATCH),
-										 errmsg("collations are not supported by type %s",
-												format_type_be($3->typoid)),
-										 parser_errposition(@4)));
-							$3->collation = $4;
+							read_datatype_tableof_decl = false;
 						}
+						else
+						{
+							PLpgSQL_variable	*var;
 
-						var = plpgsql_build_variable($1.name, $1.lineno,
-													 $3, true);
-						var->isconst = $2;
-						var->notnull = $5;
-						var->default_val = $6;
+							/*
+							 * If a collation is supplied, insert it into the
+							 * datatype.  We assume decl_datatype always returns
+							 * a freshly built struct not shared with other
+							 * variables.
+							 */
+							if (OidIsValid($4))
+							{
+								if (!OidIsValid($3->collation))
+									ereport(ERROR,
+											(errcode(ERRCODE_DATATYPE_MISMATCH),
+											 errmsg("collations are not supported by type %s",
+													format_type_be($3->typoid)),
+											 parser_errposition(@4)));
+								$3->collation = $4;
+							}
 
-						/*
-						 * The combination of NOT NULL without an initializer
-						 * can't work, so let's reject it at compile time.
-						 */
-						if (var->notnull && var->default_val == NULL)
-							ereport(ERROR,
-									(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-									 errmsg("variable \"%s\" must have a default value, since it's declared NOT NULL",
-											var->refname),
-									 parser_errposition(@5)));
+							var = plpgsql_build_variable($1.name, $1.lineno,
+														 $3, true);
+							var->isconst = $2;
+							var->notnull = $5;
+							var->default_val = $6;
+
+							/*
+							 * The combination of NOT NULL without an initializer
+							 * can't work, so let's reject it at compile time.
+							 */
+							if (var->notnull && var->default_val == NULL)
+								ereport(ERROR,
+										(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+										 errmsg("variable \"%s\" must have a default value, since it's declared NOT NULL",
+												var->refname),
+										 parser_errposition(@5)));
+						}
 					}
 				| decl_varname K_ALIAS K_FOR decl_aliasitem ';'
 					{
@@ -2162,6 +2271,25 @@ stmt_fetch		: K_FETCH opt_fetch_direction cursor_variable K_INTO
 
 						$$ = (PLpgSQL_stmt *)fetch;
 					}
+				| K_FETCH opt_fetch_direction cursor_variable K_BULK K_COLLECT K_INTO
+					{
+						PLpgSQL_stmt_fetch *fetch = $2;
+						PLpgSQL_variable *target;
+
+						read_into_target(&target, NULL);
+
+						if (yylex() != ';')
+							yyerror("syntax error");
+
+						fetch->lineno = plpgsql_location_to_lineno(@1);
+						fetch->target	= target;
+						fetch->curvar	= $3->dno;
+						fetch->is_move	= false;
+						fetch->bulk_collect = true;
+						fetch->returns_multiple_rows = true;
+
+						$$ = (PLpgSQL_stmt *)fetch;
+					}
 				;
 
 stmt_move		: K_MOVE opt_fetch_direction cursor_variable ';'
@@ -2500,10 +2628,12 @@ unreserved_keyword	:
 				| K_ARRAY
 				| K_ASSERT
 				| K_BACKWARD
+				| K_BULK
 				| K_CALL
 				| K_CHAIN
 				| K_CLOSE
 				| K_COLLATE
+				| K_COLLECT
 				| K_COLUMN
 				| K_COLUMN_NAME
 				| K_COMMIT
@@ -2542,6 +2672,7 @@ unreserved_keyword	:
 				| K_NEXT
 				| K_NO
 				| K_NOTICE
+				| K_OF
 				| K_OPEN
 				| K_OPTION
 				| K_PERFORM
@@ -2824,6 +2955,15 @@ read_datatype(int tok)
 	{
 		char   *dtname = yylval.word.ident;
 
+		/* Check if this is a registered TABLE OF type name */
+		result = lookup_tableof_type(dtname);
+		if (result)
+		{
+			tok = yylex();
+			plpgsql_push_back_token(tok);
+			return result;
+		}
+
 		tok = yylex();
 		if (tok == '%')
 		{
@@ -2925,6 +3065,44 @@ read_datatype(int tok)
 	if (type_name[0] == '\0')
 		yyerror("missing data type declaration");
 
+	/*
+	 * Check for "name IS TABLE OF basetype" pattern.
+	 * This is the Oracle-compatible TYPE ... IS TABLE OF syntax.
+	 * When the variable name is "type" (from K_TYPE unreserved keyword),
+	 * read_datatype receives the remaining text "mytype IS TABLE OF basetype".
+	 */
+	{
+		char   *tof_name;
+		char   *tof_basetype;
+
+		if (parse_tableof_pattern(type_name, &tof_name, &tof_basetype))
+		{
+			PLpgSQL_type *base_type;
+			Oid			arr_oid;
+
+			base_type = parse_datatype(tof_basetype, startlocation);
+			arr_oid = get_array_type(base_type->typoid);
+			if (!OidIsValid(arr_oid))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("could not find array type for data type %s",
+								format_type_be(base_type->typoid)),
+						 parser_errposition(startlocation)));
+
+			result = plpgsql_build_datatype(arr_oid, -1,
+										   plpgsql_curr_compile->fn_input_collation,
+										   NULL);
+			register_tableof_type(tof_name, result);
+			read_datatype_tableof_decl = true;
+
+			pfree(tof_name);
+			pfree(tof_basetype);
+			pfree(ds.data);
+			plpgsql_push_back_token(tok);
+			return result;
+		}
+	}
+
 	result = parse_datatype(type_name, startlocation);
 
 	pfree(ds.data);
@@ -2946,8 +3124,11 @@ make_execsql_stmt(int firsttoken, int location)
 	int					prev_tok;
 	bool				have_into = false;
 	bool				have_strict = false;
+	bool				have_bulk_collect = false;
 	int					into_start_loc = -1;
 	int					into_end_loc = -1;
+	bool				saw_bulk = false;
+	int					bulk_start_loc = -1;
 
 	initStringInfo(&ds);
 
@@ -2959,29 +3140,7 @@ make_execsql_stmt(int firsttoken, int location)
 	 * Scan to the end of the SQL command.  Identify any INTO-variables
 	 * clause lurking within it, and parse that via read_into_target().
 	 *
-	 * Because INTO is sometimes used in the main SQL grammar, we have to be
-	 * careful not to take any such usage of INTO as a PL/pgSQL INTO clause.
-	 * There are currently three such cases:
-	 *
-	 * 1. SELECT ... INTO.  We don't care, we just override that with the
-	 * PL/pgSQL definition.
-	 *
-	 * 2. INSERT INTO.  This is relatively easy to recognize since the words
-	 * must appear adjacently; but we can't assume INSERT starts the command,
-	 * because it can appear in CREATE RULE or WITH.  Unfortunately, INSERT is
-	 * *not* fully reserved, so that means there is a chance of a false match;
-	 * but it's not very likely.
-	 *
-	 * 3. IMPORT FOREIGN SCHEMA ... INTO.  This is not allowed in CREATE RULE
-	 * or WITH, so we just check for IMPORT as the command's first token.
-	 * (If IMPORT FOREIGN SCHEMA returned data someone might wish to capture
-	 * with an INTO-variables clause, we'd have to work much harder here.)
-	 *
-	 * Fortunately, INTO is a fully reserved word in the main grammar, so
-	 * at least we need not worry about it appearing as an identifier.
-	 *
-	 * Any future additional uses of INTO in the main grammar will doubtless
-	 * break this logic again ... beware!
+	 * We also detect the Oracle-compatible BULK COLLECT INTO pattern.
 	 */
 	tok = firsttoken;
 	for (;;)
@@ -2990,6 +3149,35 @@ make_execsql_stmt(int firsttoken, int location)
 		tok = yylex();
 		if (have_into && into_end_loc < 0)
 			into_end_loc = yylloc;		/* token after the INTO part */
+
+		/*
+		 * State machine for BULK COLLECT INTO detection.
+		 * After seeing BULK, we look for COLLECT, then INTO.
+		 */
+		if (saw_bulk)
+		{
+			if (tok_is_keyword(tok, &yylval, K_COLLECT, "collect"))
+			{
+				/* BULK COLLECT seen, check for INTO */
+				tok = yylex();
+				if (tok == K_INTO)
+				{
+					if (have_into)
+						yyerror("INTO specified more than once");
+					have_into = true;
+					have_bulk_collect = true;
+					into_start_loc = bulk_start_loc;
+					plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+					read_into_target(&target, &have_strict);
+					plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
+				}
+				saw_bulk = false;
+				continue;
+			}
+			saw_bulk = false;
+			/* fall through to process current token normally */
+		}
+
 		if (tok == ';')
 			break;
 		if (tok == 0)
@@ -3007,6 +3195,11 @@ make_execsql_stmt(int firsttoken, int location)
 			plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
 			read_into_target(&target, &have_strict);
 			plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
+		}
+		else if (tok_is_keyword(tok, &yylval, K_BULK, "bulk"))
+		{
+			saw_bulk = true;
+			bulk_start_loc = yylloc;
 		}
 	}
 
@@ -3047,6 +3240,7 @@ make_execsql_stmt(int firsttoken, int location)
 	execsql->sqlstmt = expr;
 	execsql->into	 = have_into;
 	execsql->strict	 = have_strict;
+	execsql->bulk_collect = have_bulk_collect;
 	execsql->target	 = target;
 
 	return (PLpgSQL_stmt *) execsql;
