@@ -464,6 +464,10 @@ pl_function		: comp_options pl_block opt_semi
 				;
 
 comp_options	:
+					{
+						/* Reset table-of type list for new compilation */
+						tableof_types = NULL;
+					}
 				| comp_options comp_option
 				;
 

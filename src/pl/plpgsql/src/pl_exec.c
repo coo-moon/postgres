@@ -4200,7 +4200,6 @@ exec_bulk_collect_into(PLpgSQL_execstate *estate,
 			exec_assign_value(estate, (PLpgSQL_datum *) var,
 							  PointerGetDatum(arr), false,
 							  arr_typoid, -1);
-			pfree(arr);
 			continue;
 		}
 
@@ -4225,7 +4224,6 @@ exec_bulk_collect_into(PLpgSQL_execstate *estate,
 
 		pfree(values);
 		pfree(nulls);
-		pfree(arr);
 	}
 }
 
